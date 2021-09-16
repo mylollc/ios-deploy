@@ -2,6 +2,7 @@
 
 #import <CoreFoundation/CoreFoundation.h>
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -63,6 +64,12 @@ const char* lldb_prep_noninteractive_cmds = "\
     autoexit\n\
 ";
 
+const char* lldb_prep_stopapp_cmds = "\
+    run\n\
+    kill\n\
+    autoexit\n\
+";
+
 NSMutableString * custom_commands = nil;
 
 /*
@@ -103,12 +110,14 @@ bool command_only = false;
 char *command = NULL;
 char const*target_filename = NULL;
 char const*upload_pathname = NULL;
+char const*target_dir = NULL;
 char *bundle_id = NULL;
 NSMutableArray *keys = NULL;
 bool interactive = true;
 bool justlaunch = false;
 bool file_system = false;
 bool non_recursively = false;
+bool stopapp = false;
 char *app_path = NULL;
 char *app_deltas = NULL;
 char *device_id = NULL;
@@ -1059,8 +1068,10 @@ void write_lldb_prep_cmds(AMDeviceRef device, CFURLRef disk_app_url) {
     const char* extra_cmds;
     if (!interactive)
     {
-        if (justlaunch)
-          extra_cmds = lldb_prep_noninteractive_justlaunch_cmds;
+        if (stopapp)
+            extra_cmds = lldb_prep_stopapp_cmds;
+        else if (justlaunch)
+            extra_cmds = lldb_prep_noninteractive_justlaunch_cmds;
         else
           extra_cmds = lldb_prep_noninteractive_cmds;
     }
@@ -1761,6 +1772,43 @@ void list_files(AMDeviceRef device)
     check_error(AFCConnectionClose(afc_conn_p));
 }
 
+void print_app(const void *key, const void *value, void *context)
+{
+  if ((key == NULL) || (value == NULL))
+  {
+    return;
+  }
+
+  NSString *bundle_id = (__bridge NSString*)key;
+  printf(@"%s\n", [bundle_id cStringUsingEncoding:NSUTF8StringEncoding]);
+}
+
+int app_running(AMDeviceRef device)
+{
+    if (bundle_id == NULL) {
+        NSLogOut(@"Bundle id is not specified.");
+        return 1;
+    }
+    AMDeviceConnect(device);
+    assert(AMDeviceIsPaired(device));
+    check_error(AMDeviceValidatePairing(device));
+    check_error(AMDeviceStartSession(device));
+
+    CFStringRef cf_bundle_id = CFStringCreateWithCString(NULL, bundle_id, kCFStringEncodingUTF8);
+
+    NSArray *a = [NSArray arrayWithObjects:@"CFBundleIdentifier", nil];
+    NSDictionary *optionsDict = [NSDictionary dictionaryWithObject:a forKey:@"ReturnAttributes"];
+    CFDictionaryRef options = (CFDictionaryRef)optionsDict;
+    CFDictionaryRef result = nil;
+    check_error(AMDeviceLookupApplications(device, options, &result));
+    
+    CFDictionaryApplyFunction(result, print_app, NULL);
+
+    //if (appRunning)
+    //    return 0;
+    return -1;
+}
+
 int app_exists(AMDeviceRef device)
 {
     if (bundle_id == NULL) {
@@ -2399,6 +2447,8 @@ void handle_device(AMDeviceRef device) {
             rmtree(device);
         } else if (strcmp("exists", command) == 0) {
             exit(app_exists(device));
+        } else if (strcmp("running", command) == 0) {
+            exit(app_running(device));
         } else if (strcmp("uninstall_only", command) == 0) {
             uninstall_app(device);
         } else if (strcmp("list_bundle_id", command) == 0) {
@@ -2637,9 +2687,12 @@ void usage(const char* app) {
         @"  -n, --nostart                do not start the app when debugging\n"
         @"  -N, --nolldb                 start debugserver only. do not run lldb. Can not be used with args or envs options\n"
         @"  -I, --noninteractive         start in non interactive mode (quit when app crashes or exits)\n"
+        @"  -K, --stopapp                stop the app\n"
         @"  -L, --justlaunch             just launch the app and exit lldb\n"
+        @"  -J, --justlaunch_noinstall   just launch the app without reinstalling, then exit lldb\n"
         @"  -v, --verbose                enable verbose output\n"
         @"  -m, --noinstall              directly start debugging without app install (-d not required)\n"
+        @"  -g, --running                check if the app with the given bundle_id is running or not\n"
         @"  -A, --app_deltas             incremental install. must specify a directory to store app deltas to determine what needs to be installed\n"
         @"  -p, --port <number>          port used for device, default: dynamic\n"
         @"  -r, --uninstall              uninstall the app before install (do not use with -m; app cache and data are cleared) \n"
@@ -2697,7 +2750,9 @@ int main(int argc, char *argv[]) {
         { "nostart", no_argument, NULL, 'n' },
         { "nolldb", no_argument, NULL, 'N' },
         { "noninteractive", no_argument, NULL, 'I' },
+        { "stopapp", no_argument, NULL, 'K' },
         { "justlaunch", no_argument, NULL, 'L' },
+        { "justlaunch_noinstall", no_argument, NULL, 'J' },
         { "detect", no_argument, NULL, 'c' },
         { "version", no_argument, NULL, 'V' },
         { "noinstall", no_argument, NULL, 'm' },
@@ -2713,6 +2768,7 @@ int main(int argc, char *argv[]) {
         { "rm", required_argument, NULL, 'R'},
         { "rmtree",required_argument, NULL, 'X'},
         { "exists", no_argument, NULL, 'e'},
+        { "running", no_argument, NULL, 'g'},
         { "list_bundle_id", no_argument, NULL, 'B'},
         { "no-wifi", no_argument, NULL, 'W'},
         { "get_battery_level", no_argument, NULL, 'C'},
@@ -2732,7 +2788,7 @@ int main(int argc, char *argv[]) {
     };
     int ch;
 
-    while ((ch = getopt_long(argc, argv, "VmcdvunrILefFD:R:X:i:b:a:t:p:1:2:o:l:w:9BWjNs:OE:CA:k:S:", longopts, NULL)) != -1)
+    while ((ch = getopt_long(argc, argv, "VmcdvunrILefFD:R:X:i:b:a:t:p:1:2:o:l:w:9BWjNs:OE:CA:k:S:g:JK", longopts, NULL)) != -1)
     {
         switch (ch) {
         case 'm':
@@ -2779,9 +2835,22 @@ int main(int argc, char *argv[]) {
             interactive = false;
             debug = true;
             break;
+        case 'K':
+            stopapp = true;
+            justlaunch = false;
+            install = false;
+            interactive = false;
+            debug = true;
+            break;
         case 'L':
             interactive = false;
             justlaunch = true;
+            debug = true;
+            break;
+        case 'J':
+            interactive = false;
+            justlaunch = true;
+            install = false;
             debug = true;
             break;
         case 'c':
@@ -2840,6 +2909,10 @@ int main(int argc, char *argv[]) {
         case 'e':
             command_only = true;
             command = "exists";
+            break;
+        case 'g':
+            command_only = true;
+            command = "running";
             break;
         case 'B':
             command_only = true;
@@ -2903,7 +2976,7 @@ int main(int argc, char *argv[]) {
 
     if (!app_path && !detect_only && !debugserver_only && !command_only) {
         usage(argv[0]);
-        on_error(@"One of -[b|c|o|l|w|D|N|R|X|e|B|C|S|9] is required to proceed!");
+        on_error(@"One of -[b|c|o|l|w|D|N|R|X|e|B|C|K|S|9|g] is required to proceed!");
     }
 
     if (unbuffered) {
