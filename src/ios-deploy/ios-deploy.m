@@ -169,6 +169,20 @@ const int exitcode_app_crash = 254;
         }                                                                       \
     } while (false);
 
+// Checks for MobileDevice.framework errors and tries to print them.
+#define log_error(call)                                                       \
+    do {                                                                        \
+        unsigned int err = (unsigned int)call;                                  \
+        if (err != 0)                                                           \
+        {                                                                       \
+            const char* msg = get_error_message(err);                           \
+            NSString *description = msg ? [NSString stringWithUTF8String:msg] : @"unknown."; \
+            NSLogJSON(@{@"Event": @"Error", @"Code": @(err), @"Status": description}); \
+            log_on_error(@"Error 0x%x: %@ " #call, err, description);               \
+        }                                                                       \
+    } while (false);
+
+
 
 void disable_ssl(ServiceConnRef con)
 {
@@ -182,6 +196,18 @@ void disable_ssl(ServiceConnRef con)
 
     SSL_free(con->sslContext);
     con->sslContext = NULL;
+}
+
+void log_on_error(NSString* format, ...)
+{
+    va_list valist;
+    va_start(valist, format);
+    NSString* str = [[[NSString alloc] initWithFormat:format arguments:valist] autorelease];
+    va_end(valist);
+
+    if (!_json_output) {
+        NSLog(@"[ !! ] %@", str);
+    }
 }
 
 
@@ -342,6 +368,15 @@ CFStringRef copy_xcode_dev_path(void) {
         
         if (env_dev_path && strlen(env_dev_path) > 0) {
             strcpy(xcode_dev_path, env_dev_path);
+            // DEVELOPER_DIR should refer to Xcode.app/Contents/Developer, but
+            // xcode-select and friends have an extension to fix the path, if it points to Xcode.app/.
+            static char dev_subdir[256] = { '\0' };
+            strcat(strcat(dev_subdir, env_dev_path), "/Contents/Developer");
+            struct stat sb;
+            if (stat(dev_subdir, &sb) == 0)
+            {
+                strcpy(xcode_dev_path, dev_subdir);
+            }
         } else {
             FILE *fpipe = NULL;
             char *command = "xcode-select -print-path";
@@ -1534,7 +1569,7 @@ CFStringRef copy_bundle_id(CFURLRef app_url)
     return bundle_id;
 }
 
-typedef enum { READ_DIR_FILE, READ_DIR_BEFORE_DIR, READ_DIR_AFTER_DIR } read_dir_cb_reason;
+typedef enum { READ_DIR_FILE, READ_DIR_FIFO, READ_DIR_BEFORE_DIR, READ_DIR_AFTER_DIR } read_dir_cb_reason;
 
 void read_dir(AFCConnectionRef afc_conn_p, const char* dir,
               void(*callback)(AFCConnectionRef conn, const char *dir, read_dir_cb_reason reason))
@@ -1544,6 +1579,7 @@ void read_dir(AFCConnectionRef afc_conn_p, const char* dir,
     afc_dictionary* afc_dict_p;
     char *key, *val;
     int not_dir = 0;
+    bool is_fifo = 0;
 
     unsigned int code = AFCFileInfoOpen(afc_conn_p, dir, &afc_dict_p);
     if (code != 0) {
@@ -1560,6 +1596,7 @@ void read_dir(AFCConnectionRef afc_conn_p, const char* dir,
     while((AFCKeyValueRead(afc_dict_p,&key,&val) == 0) && key && val) {
         if (strcmp(key,"st_ifmt")==0) {
             not_dir = strcmp(val,"S_IFDIR");
+            is_fifo = !strcmp(val, "S_IFIFO");
             if (_json_output) {
                 ifmt = [NSString stringWithUTF8String:val];
             } else {
@@ -1574,7 +1611,7 @@ void read_dir(AFCConnectionRef afc_conn_p, const char* dir,
         } else if (strcmp(key, "st_nlink") == 0) {
             nlink = atol(val);
         } else if (strcmp(key, "st_blocks") == 0) {
-            nlink = atol(val);
+            blocks = atol(val);
         }
     }
     AFCKeyValueClose(afc_dict_p);
@@ -1593,7 +1630,7 @@ void read_dir(AFCConnectionRef afc_conn_p, const char* dir,
     }
     
     if (not_dir) {
-        if (callback) (*callback)(afc_conn_p, dir, READ_DIR_FILE);
+        if (callback) (*callback)(afc_conn_p, dir, is_fifo ? READ_DIR_FIFO : READ_DIR_FILE);
         return;
     }
 
@@ -1745,7 +1782,7 @@ void* read_file_to_memory(char const * path, size_t* file_size)
 
 void list_files_callback(AFCConnectionRef conn, const char *name, read_dir_cb_reason reason)
 {
-    if (reason == READ_DIR_FILE) {
+    if (reason == READ_DIR_FILE || reason == READ_DIR_FIFO) {
         NSLogOut(@"%@", [NSString stringWithUTF8String:name]);
     } else if (reason == READ_DIR_BEFORE_DIR) {
         NSLogOut(@"%@/", [NSString stringWithUTF8String:name]);
@@ -1900,7 +1937,7 @@ void copy_file_callback(AFCConnectionRef afc_conn_p, const char *name, read_dir_
 
     if (*local_name=='\0') return;
 
-    if (reason == READ_DIR_FILE) {
+    if (reason == READ_DIR_FILE || reason == READ_DIR_FIFO) {
         NSLogOut(@"%@", [NSString stringWithUTF8String:name]);
         afc_file_ref fref;
         int err = AFCFileRefOpen(afc_conn_p,name,1,&fref);
@@ -2106,7 +2143,9 @@ void rmtree_callback(AFCConnectionRef conn, const char *name, read_dir_cb_reason
 {
     if (reason == READ_DIR_FILE || reason == READ_DIR_AFTER_DIR) {
         NSLogVerbose(@"Deleting %s", name);
-        check_error(AFCRemovePath(conn, name));
+        log_error(AFCRemovePath(conn, name));
+    } else if (reason == READ_DIR_FIFO) {
+        NSLogVerbose(@"Skipping %s", name);
     }
 }
 
@@ -2331,7 +2370,7 @@ void dyld_shared_cache_extract_dylibs(CFStringRef dsc_extractor_bundle_path,
   
     NSLogJSON(@{@"Event": @"DyldCacheExtract",
                  @"Source": (__bridge NSString *)shared_cache_file_path,
-                 @"Destination": (__bridge NSString *)extraction_root_path,
+                 @"Destination": @(extraction_root_path),
               });
 
     __block uint64_t last_time =
@@ -2412,7 +2451,7 @@ void handle_device(AMDeviceRef device) {
     }
     if (found_device)
     {
-        NSLogOut(@"Skipping %@.", device_full_name);
+        NSLogVerbose(@"Skipping %@.", device_full_name);
         return;
     }
     CFStringRef found_device_id = CFAutorelease(AMDeviceCopyDeviceIdentifier(device));
@@ -2421,7 +2460,7 @@ void handle_device(AMDeviceRef device) {
         if (CFStringCompare(deviceCFSTR, found_device_id, kCFCompareCaseInsensitive) == kCFCompareEqualTo) {
             found_device = true;
         } else {
-            NSLogOut(@"Skipping %@.", device_full_name);
+            NSLogVerbose(@"Skipping %@.", device_full_name);
             return;
         }
     } else {
@@ -2624,7 +2663,7 @@ void device_callback(struct am_device_notification_callback_info *info, void *ar
         {
             CFStringRef device_interface_name = get_device_interface_name(info->dev);
             CFStringRef device_uuid = AMDeviceCopyDeviceIdentifier(info->dev);
-            NSLogOut(@"[....] Disconnected %@ from %@.", device_uuid, device_interface_name);
+            NSLogVerbose(@"[....] Disconnected %@ from %@.", device_uuid, device_interface_name);
             if (detect_only && _json_output) {
                 NSLogJSON(@{@"Event": @"DeviceDisconnected",
                             @"Device": get_device_json_dict(info->dev)
