@@ -98,11 +98,21 @@ int AMDeviceMountImage(AMDeviceRef device, CFStringRef image, CFDictionaryRef op
 mach_error_t AMDeviceLookupApplications(AMDeviceRef device, CFDictionaryRef options, CFDictionaryRef *result);
 int AMDeviceGetInterfaceType(AMDeviceRef device);
 AMDeviceRef AMDeviceCopyPairedCompanion(AMDeviceRef device);
+#if defined(IOS_DEPLOY_FEATURE_DEVELOPER_MODE)
+unsigned int AMDeviceCopyDeveloperModeStatus(AMDeviceRef device, uint32_t *error_code);
+#endif
 
 int AMDServiceConnectionSend(ServiceConnRef con, const void * data, size_t size);
 int AMDServiceConnectionReceive(ServiceConnRef con, void * data, size_t size);
 uint64_t AMDServiceConnectionReceiveMessage(ServiceConnRef con, CFPropertyListRef message, CFPropertyListFormat *format);
 uint64_t AMDServiceConnectionSendMessage(ServiceConnRef con, CFPropertyListRef message, CFPropertyListFormat format);
+CFArrayRef AMDeviceCopyProvisioningProfiles(AMDeviceRef device);
+int AMDeviceInstallProvisioningProfile(AMDeviceRef device, void *profile);
+int AMDeviceRemoveProvisioningProfile(AMDeviceRef device, CFStringRef uuid);
+CFStringRef MISProfileGetValue(void *profile, CFStringRef key);
+CFDictionaryRef MISProfileCopyPayload(void *profile);
+void *MISProfileCreateWithData(int zero, CFDataRef data);
+int MISProfileWriteToFile(void *profile, CFStringRef dest_path);
 
 bool found_device = false, debug = false, verbose = false, unbuffered = false, nostart = false, debugserver_only = false, detect_only = false, install = true, uninstall = false, no_wifi = false;
 bool faster_path_search = false;
@@ -126,6 +136,8 @@ char *envs = NULL;
 char *list_root = NULL;
 const char * custom_script_path = NULL;
 char *symbols_download_directory = NULL;
+char *profile_uuid = NULL;
+char *profile_path = NULL;
 int _timeout = 0;
 int _detectDeadlockTimeout = 0;
 bool _json_output = false;
@@ -456,6 +468,17 @@ device_desc get_device_desc(CFStringRef model) {
     return res;
 }
 
+bool is_usb_device(const AMDeviceRef device) {
+  return AMDeviceGetInterfaceType(device) == 1;
+}
+
+void connect_and_start_session(AMDeviceRef device) {
+    AMDeviceConnect(device);
+    assert(AMDeviceIsPaired(device));
+    check_error(AMDeviceValidatePairing(device));
+    check_error(AMDeviceStartSession(device));
+}
+
 CFStringRef get_device_full_name(const AMDeviceRef device) {
     CFStringRef full_name = NULL,
                 device_udid = AMDeviceCopyDeviceIdentifier(device),
@@ -521,7 +544,7 @@ CFStringRef get_device_full_name(const AMDeviceRef device) {
 
 NSDictionary* get_device_json_dict(const AMDeviceRef device) {
     NSMutableDictionary *json_dict = [NSMutableDictionary new];
-    AMDeviceConnect(device);
+    is_usb_device(device) ? AMDeviceConnect(device) : connect_and_start_session(device);
     
     CFStringRef device_udid = AMDeviceCopyDeviceIdentifier(device);
     if (device_udid) {
@@ -606,7 +629,7 @@ CFMutableArrayRef copy_device_product_version_parts(AMDeviceRef device) {
 CFStringRef copy_device_support_path(AMDeviceRef device, CFStringRef suffix) {
     time_t startTime, endTime;
     time( &startTime );
-    
+
     CFStringRef version = NULL;
     CFStringRef build = AMDeviceCopyValue(device, 0, CFSTR("BuildVersion"));
     CFStringRef deviceClass = AMDeviceCopyValue(device, 0, CFSTR("DeviceClass"));
@@ -627,7 +650,7 @@ CFStringRef copy_device_support_path(AMDeviceRef device, CFStringRef suffix) {
     NSLogVerbose(@"build: %@", build);
 
     CFStringRef deviceClassPath[2];
-    
+
     if (CFStringCompare(CFSTR("AppleTV"), deviceClass, 0) == kCFCompareEqualTo) {
       deviceClassPath[0] = CFSTR("Platforms/AppleTVOS.platform/DeviceSupport");
       deviceClassPath[1] = CFSTR("tvOS DeviceSupport");
@@ -640,10 +663,12 @@ CFStringRef copy_device_support_path(AMDeviceRef device, CFStringRef suffix) {
       deviceClassPath[0] = CFSTR("Platforms/iPhoneOS.platform/DeviceSupport");
       deviceClassPath[1] = CFSTR("iOS DeviceSupport");
     }
+
+    CFMutableArrayRef string_allocations = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
     while (CFArrayGetCount(version_parts) > 0) {
         version = CFStringCreateByCombiningStrings(NULL, version_parts, CFSTR("."));
         NSLogVerbose(@"version: %@", version);
-        
+
         for( int i = 0; i < 2; ++i ) {
             if (path == NULL) {
                 CFStringRef search = CFStringCreateWithFormat(NULL, NULL, CFSTR("%@ (%@) %@/%@"), version, build, deviceArch, suffix);
@@ -656,13 +681,13 @@ CFStringRef copy_device_support_path(AMDeviceRef device, CFStringRef suffix) {
                 path = copy_xcode_path_for(deviceClassPath[i], search);
                 CFRelease(search);
             }
-            
+
             if (path == NULL) {
                 CFStringRef search = CFStringCreateWithFormat(NULL, NULL, CFSTR("%@ (*)/%@"), version, suffix);
                 path = copy_xcode_path_for(deviceClassPath[i], search);
                 CFRelease(search);
             }
-            
+
             if (path == NULL) {
                 CFStringRef search = CFStringCreateWithFormat(NULL, NULL, CFSTR("%@/%@"), version, suffix);
                 path = copy_xcode_path_for(deviceClassPath[i], search);
@@ -680,14 +705,39 @@ CFStringRef copy_device_support_path(AMDeviceRef device, CFStringRef suffix) {
                 CFRelease(search);
             }
         }
-        
+
         CFRelease(version);
         if (path != NULL) {
             break;
         }
+
+        // Not all iOS versions have a dedicated developer disk image. Xcode 13.4.1 supports
+        // iOS up to 15.5 but does not include developer disk images for 15.1 or 15.3
+        // despite being able to deploy to them. For this reason, this logic looks for previous
+        // minor versions if it doesn't find an exact match. In the case where the disk image
+        // from a previous minor version is not compatible, deployment will fail with
+        // kAMDInvalidServiceError.
+        CFStringRef previous_minor_version = NULL;
+        if (CFEqual(CFSTR("DeveloperDiskImage.dmg"), suffix) &&
+            CFArrayGetCount(version_parts) == 2) {
+            int minor_version = CFStringGetIntValue(CFArrayGetValueAtIndex(version_parts, 1));
+            if (minor_version > 0) {
+                previous_minor_version = CFStringCreateWithFormat(kCFAllocatorDefault, NULL,
+                                                                  CFSTR("%d"), minor_version - 1);
+                CFArrayAppendValue(string_allocations, previous_minor_version);
+            }
+        }
         CFArrayRemoveValueAtIndex(version_parts, CFArrayGetCount(version_parts) - 1);
+        if (previous_minor_version) {
+            CFArrayAppendValue(version_parts, previous_minor_version);
+        }
     }
-    
+
+    for (int i = 0; i < CFArrayGetCount(string_allocations); i++) {
+        CFRelease(CFArrayGetValueAtIndex(string_allocations, i));
+    }
+    CFRelease(string_allocations);
+
     for( int i = 0; i < 2; ++i ) {
         if (path == NULL) {
             CFStringRef search = CFStringCreateWithFormat(NULL, NULL, CFSTR("Latest/%@"), suffix);
@@ -1216,13 +1266,6 @@ void fdvendor_callback(CFSocketRef s, CFSocketCallBackType callbackType, CFDataR
     CFRelease(s);
 }
 
-void connect_and_start_session(AMDeviceRef device) {
-    AMDeviceConnect(device);
-    assert(AMDeviceIsPaired(device));
-    check_error(AMDeviceValidatePairing(device));
-    check_error(AMDeviceStartSession(device));
-}
-
 void start_remote_debug_server(AMDeviceRef device) {
 
     dbgServiceConnection = NULL;
@@ -1389,6 +1432,11 @@ void setup_lldb(AMDeviceRef device, CFURLRef url) {
     device_interface_name = get_device_interface_name(device);
 
     connect_and_start_session(device);
+    CFBooleanRef is_password_protected = AMDeviceCopyValue(device, 0, CFSTR("PasswordProtected"));
+    NSLogJSON(@{@"Event": @"PasswordProtectedStatus",
+                @"Status": @(CFBooleanGetValue(is_password_protected)),
+    });
+    CFRelease(is_password_protected);
 
     NSLogOut(@"------ Debug phase ------");
 
@@ -1892,6 +1940,143 @@ void get_battery_level(AMDeviceRef device)
     check_error(AMDeviceDisconnect(device));
 }
 
+void replace_dict_date_with_absolute_time(CFMutableDictionaryRef dict, CFStringRef key) {
+    CFDateRef date = CFDictionaryGetValue(dict, key);
+    CFAbsoluteTime absolute_date = CFDateGetAbsoluteTime(date);
+    CFNumberRef absolute_date_ref = CFNumberCreate(NULL, kCFNumberDoubleType, &absolute_date);
+    CFDictionaryReplaceValue(dict, key, absolute_date_ref);
+    CFRelease(absolute_date_ref);
+}
+
+void list_provisioning_profiles(AMDeviceRef device) {
+    connect_and_start_session(device);
+    CFArrayRef device_provisioning_profiles = AMDeviceCopyProvisioningProfiles(device);
+
+    CFIndex provisioning_profiles_count = CFArrayGetCount(device_provisioning_profiles);
+    CFMutableArrayRef serializable_provisioning_profiles =
+        CFArrayCreateMutable(NULL, provisioning_profiles_count, &kCFTypeArrayCallBacks);
+
+    for (CFIndex i = 0; i < provisioning_profiles_count; i++) {
+        void *device_provisioning_profile =
+            (void *)CFArrayGetValueAtIndex(device_provisioning_profiles, i);
+        CFMutableDictionaryRef serializable_provisioning_profile;
+
+        if (verbose) {
+            // Verbose output; We selectively omit keys from profile.
+            CFDictionaryRef immutable_profile_dict =
+                MISProfileCopyPayload(device_provisioning_profile);
+            serializable_provisioning_profile =
+                CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, immutable_profile_dict);
+            CFRelease(immutable_profile_dict);
+
+            // Remove binary values from the output since they aren't readable and add a whole lot
+            // of noise to the output.
+            CFDictionaryRemoveValue(serializable_provisioning_profile,
+                                    CFSTR("DER-Encoded-Profile"));
+            CFDictionaryRemoveValue(serializable_provisioning_profile,
+                                    CFSTR("DeveloperCertificates"));
+        } else {
+            // Normal output; We selectively include keys from profile.
+            CFStringRef keys[] = {CFSTR("Name"), CFSTR("UUID"), CFSTR("ExpirationDate")};
+            CFIndex size = sizeof(keys) / sizeof(CFStringRef);
+            serializable_provisioning_profile =
+                CFDictionaryCreateMutable(kCFAllocatorDefault, size, &kCFTypeDictionaryKeyCallBacks,
+                                          &kCFTypeDictionaryValueCallBacks);
+            for (CFIndex i = 0; i < size; i++) {
+                CFStringRef key = keys[i];
+                CFStringRef value = MISProfileGetValue(device_provisioning_profile, key);
+                CFDictionaryAddValue(serializable_provisioning_profile, key, value);
+            }
+        }
+
+        if (_json_output) {
+            // JSON output can't have CFDate objects so convert dates into CFAbsoluteTime's.
+            replace_dict_date_with_absolute_time(serializable_provisioning_profile,
+                                                 CFSTR("ExpirationDate"));
+            replace_dict_date_with_absolute_time(serializable_provisioning_profile,
+                                                 CFSTR("CreationDate"));
+        }
+
+        CFArrayAppendValue(serializable_provisioning_profiles, serializable_provisioning_profile);
+        CFRelease(serializable_provisioning_profile);
+    }
+    CFRelease(device_provisioning_profiles);
+
+    if (_json_output) {
+        NSLogJSON(@{
+            @"Event" : @"ListProvisioningProfiles",
+            @"Profiles" : (NSArray *)serializable_provisioning_profiles
+        });
+    } else {
+        NSLogOut(@"%@", serializable_provisioning_profiles);
+    }
+    CFRelease(serializable_provisioning_profiles);
+}
+
+void install_provisioning_profile(AMDeviceRef device) {
+    if (!profile_path) {
+        on_error(@"no path to provisioning profile specified");
+    }
+
+    size_t file_size = 0;
+    void *file_content = read_file_to_memory(profile_path, &file_size);
+    CFDataRef profile_data = CFDataCreate(NULL, file_content, file_size);
+    void *profile = MISProfileCreateWithData(0, profile_data);
+    connect_and_start_session(device);
+    check_error(AMDeviceInstallProvisioningProfile(device, profile));
+
+    free(file_content);
+    CFRelease(profile_data);
+    CFRelease(profile);
+}
+
+void uninstall_provisioning_profile(AMDeviceRef device) {
+    if (!profile_uuid) {
+        on_error(@"no profile UUID specified via --profile-uuid");
+    }
+
+    CFStringRef uuid = CFStringCreateWithCString(NULL, profile_uuid, kCFStringEncodingUTF8);
+    connect_and_start_session(device);
+    check_error(AMDeviceRemoveProvisioningProfile(device, uuid));
+    CFRelease(uuid);
+}
+
+void download_provisioning_profile(AMDeviceRef device) {
+    if (!profile_uuid) {
+        on_error(@"no profile UUID specified via --profile-uuid");
+    } else if (!profile_path) {
+        on_error(@"no download path specified");
+    }
+
+    connect_and_start_session(device);
+    CFArrayRef device_provisioning_profiles = AMDeviceCopyProvisioningProfiles(device);
+    CFIndex provisioning_profiles_count = CFArrayGetCount(device_provisioning_profiles);
+    CFStringRef uuid = CFStringCreateWithCString(NULL, profile_uuid, kCFStringEncodingUTF8);
+    bool found_matching_uuid = false;
+
+    for (CFIndex i = 0; i < provisioning_profiles_count; i++) {
+        void *profile = (void *)CFArrayGetValueAtIndex(device_provisioning_profiles, i);
+        CFStringRef other_uuid = MISProfileGetValue(profile, CFSTR("UUID"));
+        found_matching_uuid = CFStringCompare(uuid, other_uuid, 0) == kCFCompareEqualTo;
+
+        if (found_matching_uuid) {
+            NSLogVerbose(@"Writing %@ to %s", MISProfileGetValue(profile, CFSTR("Name")),
+                         profile_path);
+            CFStringRef dst_path =
+                CFStringCreateWithCString(NULL, profile_path, kCFStringEncodingUTF8);
+            check_error(MISProfileWriteToFile(profile, dst_path));
+            CFRelease(dst_path);
+            break;
+        }
+    }
+
+    CFRelease(uuid);
+    CFRelease(device_provisioning_profiles);
+    if (!found_matching_uuid) {
+        on_error(@"Did not find provisioning profile with UUID %x on device", profile_uuid);
+    }
+}
+
 void list_bundle_id(AMDeviceRef device)
 {
     connect_and_start_session(device);
@@ -2187,6 +2372,34 @@ void uninstall_app(AMDeviceRef device) {
     }
 }
 
+#if defined(IOS_DEPLOY_FEATURE_DEVELOPER_MODE)
+void check_developer_mode(AMDeviceRef device) {
+  unsigned int error_code = 0;
+  bool is_enabled = AMDeviceCopyDeveloperModeStatus(device, &error_code);
+
+  if (error_code) {
+    const char *mobdev_error = get_error_message(error_code);
+    NSString *error_description = mobdev_error ? [NSString stringWithUTF8String:mobdev_error] : @"unknown.";
+    if (_json_output) {
+      NSLogJSON(@{
+        @"Event": @"DeveloperMode",
+        @"IsEnabled": @(is_enabled),
+        @"Code": @(error_code),
+        @"Status": error_description,
+      });
+    } else {
+      NSLogOut(@"Encountered error checking developer mode status: %@", error_description);
+    }
+  } else {
+    if (_json_output) {
+      NSLogJSON(@{@"Event": @"DeveloperMode", @"IsEnabled": @(is_enabled)});
+    } else {
+      NSLogOut(@"Developer mode is%s enabled.", is_enabled ? "" : " not");
+    }
+  }
+}
+#endif
+
 void start_symbols_service_with_command(AMDeviceRef device, uint32_t command) {
     connect_and_start_session(device);
     check_error(AMDeviceSecureStartService(device, symbols_service_name,
@@ -2324,9 +2537,12 @@ CFStringRef download_dyld_file(AMDeviceRef device, uint32_t dyld_index,
 CFStringRef create_dsc_bundle_path_for_device(AMDeviceRef device) {
     CFStringRef xcode_dev_path = copy_xcode_dev_path();
 
-    AMDeviceConnect(device);
+    is_usb_device(device) ? AMDeviceConnect(device) : connect_and_start_session(device);
     CFStringRef device_class = AMDeviceCopyValue(device, 0, CFSTR("DeviceClass"));
     AMDeviceDisconnect(device);
+    if (!device_class) {
+      on_error(@"Failed to determine device class");
+    }
 
     CFStringRef platform_name;
     if (CFStringCompare(CFSTR("AppleTV"), device_class, 0) == kCFCompareEqualTo) {
@@ -2420,15 +2636,23 @@ void download_device_symbols(AMDeviceRef device) {
                  @"Files": (__bridge NSArray *)files,
               });
     CFStringRef dsc_extractor_bundle = create_dsc_bundle_path_for_device(device);
+    CFMutableArrayRef downloaded_files = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
 
+    // download files
     for (uint32_t i = 0; i < files_count; ++i) {
         CFStringRef filepath = (CFStringRef)CFArrayGetValueAtIndex(files, i);
         CFStringRef download_path = download_dyld_file(device, i, filepath);
+        CFArrayAppendValue(downloaded_files, download_path);
+    }
+    // extract files
+    for (uint32_t i = 0; i < files_count; ++i) {
+        CFStringRef download_path = (CFStringRef)CFArrayGetValueAtIndex(downloaded_files, i);
         dyld_shared_cache_extract_dylibs(dsc_extractor_bundle, download_path,
                                              symbols_download_directory);
         CFRelease(download_path);
     }
 
+    CFRelease(downloaded_files);
     CFRelease(dsc_extractor_bundle);
 }
 
@@ -2441,6 +2665,7 @@ void handle_device(AMDeviceRef device) {
     if (detect_only) {
         if (_json_output) {
             NSLogJSON(@{@"Event": @"DeviceDetected",
+                        @"Interface": (__bridge NSString *)device_interface_name,
                         @"Device": get_device_json_dict(device)
                         });
         } else {
@@ -2496,7 +2721,19 @@ void handle_device(AMDeviceRef device) {
             get_battery_level(device);
         } else if (strcmp("symbols", command) == 0) {
             download_device_symbols(device);
-        }
+        } else if (strcmp("list_profiles", command) == 0) {
+            list_provisioning_profiles(device);
+        } else if (strcmp("install_profile", command) == 0) {
+            install_provisioning_profile(device);
+        } else if (strcmp("uninstall_profile", command) == 0) {
+            uninstall_provisioning_profile(device);
+        } else if (strcmp("download_profile", command) == 0) {
+            download_provisioning_profile(device);
+#if defined(IOS_DEPLOY_FEATURE_DEVELOPER_MODE)
+        } else if (strcmp("check_developer_mode", command) == 0) {
+          check_developer_mode(device);
+#endif
+      }
         exit(0);
     }
 
@@ -2546,16 +2783,7 @@ void handle_device(AMDeviceRef device) {
         NSLogOut(@"------ Install phase ------");
         NSLogOut(@"[  0%%] Found %@ connected through %@, beginning install", device_full_name, device_interface_name);
 
-        CFStringRef install_bundle_id = NULL;
-        if (bundle_id != NULL) {
-          install_bundle_id = CFStringCreateWithCString(NULL, bundle_id, kCFStringEncodingUTF8);
-        } else {
-          CFStringRef extracted_bundle_id = copy_bundle_id(url);
-          if (extracted_bundle_id == NULL) {
-            on_error(@"[ ERROR] Could not determine bundle id.");
-          }
-          install_bundle_id = extracted_bundle_id;
-        }
+        CFStringRef install_bundle_id = bundle_id == NULL ? copy_bundle_id(url) : CFStringCreateWithCString(NULL, bundle_id, kCFStringEncodingUTF8);
 
         CFDictionaryRef options;
         if (app_deltas == NULL) { // standard install
@@ -2569,6 +2797,9 @@ void handle_device(AMDeviceRef device) {
           check_error(AMDeviceStopSession(device));
           check_error(AMDeviceDisconnect(device));
         } else { // incremental install
+          if (install_bundle_id == NULL) {
+            on_error(@"[ ERROR] Could not determine bundle id.");
+          }
           CFStringRef deltas_path =
             CFStringCreateWithCString(NULL, app_deltas, kCFStringEncodingUTF8);
           CFURLRef deltas_relative_url =
@@ -2610,24 +2841,32 @@ void handle_device(AMDeviceRef device) {
 
         CFRelease(options);
 
-        connect_and_start_session(device);
-        CFURLRef device_app_url = copy_device_app_url(device, install_bundle_id);
-        check_error(AMDeviceStopSession(device));
-        check_error(AMDeviceDisconnect(device));
-        CFStringRef device_app_path = CFURLCopyFileSystemPath(device_app_url, kCFURLPOSIXPathStyle);
-
         NSLogOut(@"[100%%] Installed package %@", [NSString stringWithUTF8String:app_path]);
-        NSLogVerbose(@"App path: %@", device_app_path);
-        NSLogJSON(@{@"Event": @"BundleInstall",
-                    @"OverallPercent": @(100),
-                    @"Percent": @(100),
-                    @"Status": @"Complete",
-                    @"Path": (__bridge NSString *)device_app_path
-                    });
+        if (install_bundle_id == NULL) {
+          NSLogJSON(@{@"Event": @"BundleInstall",
+                      @"OverallPercent": @(100),
+                      @"Percent": @(100),
+                      @"Status": @"Complete"
+                      });
+        } else {
+          connect_and_start_session(device);
+          CFURLRef device_app_url = copy_device_app_url(device, install_bundle_id);
+          check_error(AMDeviceStopSession(device));
+          check_error(AMDeviceDisconnect(device));
+          CFStringRef device_app_path = CFURLCopyFileSystemPath(device_app_url, kCFURLPOSIXPathStyle);
+          
+          NSLogVerbose(@"App path: %@", device_app_path);
+          NSLogJSON(@{@"Event": @"BundleInstall",
+                      @"OverallPercent": @(100),
+                      @"Percent": @(100),
+                      @"Status": @"Complete",
+                      @"Path": (__bridge NSString *)device_app_path
+                      });
 
-      CFRelease(device_app_url);
-      CFRelease(install_bundle_id);
-      CFRelease(device_app_path);
+          CFRelease(device_app_url);
+          CFRelease(install_bundle_id);
+          CFRelease(device_app_path);
+        }
     }
     CFRelease(path);
 
@@ -2666,6 +2905,7 @@ void device_callback(struct am_device_notification_callback_info *info, void *ar
             NSLogVerbose(@"[....] Disconnected %@ from %@.", device_uuid, device_interface_name);
             if (detect_only && _json_output) {
                 NSLogJSON(@{@"Event": @"DeviceDisconnected",
+                            @"Interface": (__bridge NSString *)device_interface_name,
                             @"Device": get_device_json_dict(info->dev)
                             });
             }
@@ -2717,7 +2957,7 @@ void usage(const char* app) {
         @"Usage: %@ [OPTION]...\n"
         @"  -d, --debug                  launch the app in lldb after installation\n"
         @"  -i, --id <device_id>         the id of the device to connect to\n"
-        @"  -c, --detect                 only detect if the device is connected\n"
+        @"  -c, --detect                 list all connected devices\n"
         @"  -b, --bundle <bundle.app>    the path to the app bundle to be installed\n"
         @"  -a, --args <args>            command line arguments to pass to the app when launching it\n"
         @"  -s, --envs <envs>            environment variables, space separated key-value pairs, to pass to the app when launching it\n"
@@ -2759,7 +2999,17 @@ void usage(const char* app) {
         @"  -k, --key                    keys for the properties of the bundle. Joined by ',' and used only with -B <list_bundle_id> and -j <json> \n"
         @"  --custom-script <script>     path to custom python script to execute in lldb\n"
         @"  --custom-command <command>   specify additional lldb commands to execute\n"
-        @"  --faster-path-search         use alternative logic to find the device support paths faster\n",
+        @"  --faster-path-search         use alternative logic to find the device support paths faster\n"
+        @"  -P, --list_profiles          list all provisioning profiles on device\n"
+        @"  --profile-uuid <uuid>        the UUID of the provisioning profile to target, use with other profile commands\n"
+        @"  --profile-download <path>    download a provisioning profile (requires --profile-uuid)\n"
+        @"  --profile-install <file>     install a provisioning profile\n"
+        @"  --profile-uninstall          uninstall a provisioning profile (requires --profile-uuid <UUID>)\n"
+#if defined(IOS_DEPLOY_FEATURE_DEVELOPER_MODE)
+        @"  --check-developer-mode       checks whether the given device has developer mode enabled (requires Xcode 14 or newer)\n",
+#else
+        ,
+#endif
         [NSString stringWithUTF8String:app]);
 }
 
@@ -2820,9 +3070,17 @@ int main(int argc, char *argv[]) {
         { "non-recursively", no_argument, NULL, 'F'},
         { "key", optional_argument, NULL, 'k' },
         { "symbols", required_argument, NULL, 'S' },
+        { "list_profiles", no_argument, NULL, 'P' },
         { "custom-script", required_argument, NULL, 1001},
         { "custom-command", required_argument, NULL, 1002},
         { "faster-path-search", no_argument, NULL, 1003},
+        { "profile-install", required_argument, NULL, 1004},
+        { "profile-uninstall", no_argument, NULL, 1005},
+        { "profile-download", required_argument, NULL, 1006},
+        { "profile-uuid", required_argument, NULL, 1007},
+#if defined(IOS_DEPLOY_FEATURE_DEVELOPER_MODE)
+        { "check-developer-mode", no_argument, NULL, 1008},
+#endif
         { NULL, 0, NULL, 0 },
     };
     int ch;
@@ -2997,6 +3255,33 @@ int main(int argc, char *argv[]) {
             break;
         case 1003:
             faster_path_search = true;
+            break;
+        case 1004:
+            command_only = true;
+            command = "install_profile";
+            profile_path = optarg;
+            break;
+        case 1005:
+            command_only = true;
+            command = "uninstall_profile";
+            break;
+        case 1006:
+            command_only = true;
+            command = "download_profile";
+            profile_path = optarg;
+            break;
+        case 1007:
+            profile_uuid = optarg;
+            break;
+#if defined(IOS_DEPLOY_FEATURE_DEVELOPER_MODE)
+        case 1008:
+          command_only = true;
+          command = "check_developer_mode";
+          break;
+#endif
+        case 'P':
+            command_only = true;
+            command = "list_profiles";
             break;
         case 'k':
             if (!keys) keys = [[NSMutableArray alloc] init];
