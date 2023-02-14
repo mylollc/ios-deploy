@@ -1,3 +1,18 @@
+To sync repo fork
+==========
+* https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/configuring-a-remote-repository-for-a-fork
+* Make sure upstream is set 
+* `git remote -v`
+* `origin	git@github.com:mylollc/ios-deploy.git (fetch)`
+* `origin	git@github.com:mylollc/ios-deploy.git (push)`
+* `upstream	https://github.com/ios-control/ios-deploy.git (fetch)`
+* `upstream	https://github.com/ios-control/ios-deploy.git (push)`
+
+* `git fetch upstream`
+* `git merge upstream/master`
+
+
+
 [![Build Status](https://travis-ci.org/ios-control/ios-deploy.svg?branch=master)](https://travis-ci.org/ios-control/ios-deploy)
 
 ios-deploy
